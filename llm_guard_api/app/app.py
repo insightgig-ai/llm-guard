@@ -206,14 +206,26 @@ def register_routes(
     async def submit_analyze_output(
         request: AnalyzeOutputRequest,
         _: Annotated[bool, Depends(check_auth)],
-        output_scanners: List[OutputScanner] = Depends(output_scanners_func),
+        # REMOVED: output_scanners: List[OutputScanner] = Depends(output_scanners_func)
     ) -> AnalyzeOutputResponse:
+        """
+        Analyze model output and restore PII via deanonymization.
+        Restores Vault from client-provided data.
+        """
         LOGGER.debug(
             "Received analyze output request",
             request_prompt=request.prompt,
             request_output=request.output,
+            vault_entries=len(request.vault_data) if request.vault_data else 0,
         )
 
+        # Restore Vault from client-provided data (stateless operation)
+        vault = Vault(tuples=request.vault_data if request.vault_data else [])
+
+        # Create scanners with this request's vault
+        output_scanners = get_output_scanners(config.output_scanners, vault)
+
+        # Apply scanner suppression if requested
         if request.scanners_suppress is not None and len(request.scanners_suppress) > 0:
             LOGGER.debug("Suppressing scanners", scanners=request.scanners_suppress)
             output_scanners = [
@@ -222,6 +234,7 @@ def register_routes(
                 if type(scanner).__name__ not in request.scanners_suppress
             ]
 
+        # Run the scanning logic (same as before)
         with concurrent.futures.ThreadPoolExecutor() as executor:
             loop = asyncio.get_event_loop()
             try:
@@ -243,14 +256,17 @@ def register_routes(
                         1, {"source": "output", "valid": valid, "scanner": scanner}
                     )
 
+                # Return response WITH vault_data
                 response = AnalyzeOutputResponse(
                     sanitized_output=sanitized_output,
                     is_valid=all(results_valid.values()),
                     scanners=results_score,
+                    vault_data=vault.get(),  # <-- NEW: Return vault data
                 )
+
                 elapsed_time = time.time() - start_time
                 LOGGER.debug(
-                    "Sanitized response",
+                    "Sanitized output response returned",
                     scores=results_score,
                     elapsed_time_seconds=round(elapsed_time, 6),
                 )
@@ -343,10 +359,23 @@ def register_routes(
         request: AnalyzePromptRequest,
         _: Annotated[bool, Depends(check_auth)],
         response: Response,
-        input_scanners: List[InputScanner] = Depends(input_scanners_func),
+        # REMOVED: input_scanners: List[InputScanner] = Depends(input_scanners_func)
     ) -> AnalyzePromptResponse:
+        """
+        Analyze and sanitize the input prompt.
+        Creates a fresh Vault per request for tenant isolation.
+        """
         LOGGER.debug("Received analyze prompt request", request_prompt=request.prompt)
 
+        # Create fresh Vault for this request (isolated from other requests)
+        # This ensures no PII data leaks between requests
+        vault = Vault(tuples=request.vault_data if request.vault_data else [])
+
+        # Create scanners with this request's vault (bypass cached scanners)
+        # Models are already loaded in memory, only scanner instances are recreated
+        input_scanners = get_input_scanners(config.input_scanners, vault)
+
+        # Apply scanner suppression if requested
         if request.scanners_suppress is not None and len(request.scanners_suppress) > 0:
             LOGGER.debug("Suppressing scanners", scanners=request.scanners_suppress)
             input_scanners = [
@@ -355,6 +384,7 @@ def register_routes(
                 if type(scanner).__name__ not in request.scanners_suppress
             ]
 
+        # Run the scanning logic (same as before)
         with concurrent.futures.ThreadPoolExecutor() as executor:
             loop = asyncio.get_event_loop()
             try:
@@ -375,16 +405,19 @@ def register_routes(
                         1, {"source": "input", "valid": valid, "scanner": scanner}
                     )
 
+                # Return response WITH vault_data for client to store
                 response = AnalyzePromptResponse(
                     sanitized_prompt=sanitized_prompt,
                     is_valid=all(results_valid.values()),
                     scanners=results_score,
+                    vault_data=vault.get(),  # <-- NEW: Return vault data
                 )
 
                 elapsed_time = time.time() - start_time
                 LOGGER.debug(
                     "Sanitized prompt response returned",
                     scores=results_score,
+                    vault_entries=len(vault.get()),
                     elapsed_time_seconds=round(elapsed_time, 6),
                 )
             except asyncio.TimeoutError:
